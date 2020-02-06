@@ -31,11 +31,6 @@ from bcc import BPF
 PROJECT_PATH = os.path.dirname(os.path.realpath(__file__))
 BPF_PROGRAM_PATH = os.path.realpath(os.path.join(PROJECT_PATH, 'bpf_program.c'))
 
-# Get page size from sysconf
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-# Get page shift from page size
-PAGE_SHIFT = int(math.log(PAGE_SIZE, 2))
-
 DESCRIPTION = """
 Snooping all signals sent to a pid/comm.
 Created by William Findlay for teaching purposes.
@@ -50,12 +45,7 @@ def print_formatted_items(*args, header=0):
     """
     Print items according to the specified row format.
     """
-    row_format = "{:>8} {:>16} {:>16}"
-    if not header:
-        row_format += " -> "
-    else:
-        row_format += "    "
-    row_format += "{:<16} {:>8}"
+    row_format = "{:>16} {:>8} {:>10} {:>5} {:>5} {:>16}"
     print(row_format.format(*args))
 
 def on_exit(bpf):
@@ -80,13 +70,21 @@ def register_perf_buffers(bpf):
     """
     Register perf buffers with BPF program.
     """
-    def sigreturn(cpu, data, size):
+    def sig_enter_events(cpu, data, size):
         # Read event data from perf buffer
-        v = bpf["sigreturn"].event(data)
+        v = bpf["sig_enter_events"].event(data)
+
+    bpf["sig_enter_events"].open_perf_buffer(sig_enter_events, page_cnt=2**5)
+
+    def sig_return_events(cpu, data, size):
+        # Read event data from perf buffer
+        v = bpf["sig_return_events"].event(data)
+
+        comm = v.comm.decode('utf-8')
 
         # Print information
-        #print_formatted_items(v.pid, v.comm.decode('utf-8'))
-    bpf["sigreturn"].open_perf_buffer(sigreturn, page_cnt=2**5)
+        print_formatted_items(comm, v.pid, signal.Signals(v.signal).name, v.code, v.errno, v.overhead / (10 ** 9))
+    bpf["sig_return_events"].open_perf_buffer(sig_return_events, page_cnt=2**5)
 
 if __name__ == '__main__':
     # Parse arguments
@@ -114,24 +112,19 @@ if __name__ == '__main__':
     flags = []
     flags.append(f"-I{PROJECT_PATH}")
     if args.pid:
-        flags.append(f"-DHEAPSNOOP_PID={args.pid}")
+        flags.append(f"-DSIGSNOOP_PID={args.pid}")
     if args.comm:
-        flags.append(f"-DHEAPSNOOP_COMM=\"{args.comm}\"")
-    if args.debug:
-        flags.append(f"-DHEAPSNOOP_DEBUG")
+        flags.append(f"-DSIGSNOOP_COMM=\"{args.comm}\"")
 
     # Load bpf program
     bpf = BPF(text=text, cflags=flags)
     pid = -1 if not args.pid else args.pid
-    attach_uprobes(bpf, "malloc", pid)
-    attach_uprobes(bpf, "calloc", pid)
     register_perf_buffers(bpf)
     atexit.register(on_exit, bpf)
 
-    print("Tracing process memory, ctrl-c to quit...", file=sys.stderr)
-    print_formatted_items("PID", "COMM", "VIRT ADDR", "PHYS ADDR", "SIZE", header=1)
+    print("Tracing signals, ctrl-c to quit...", file=sys.stderr)
+    print_formatted_items("COMM", "PID", "SIGNAL", "CODE", "ERRNO", "OVERHEAD (S)", header=1)
     while True:
-        if args.debug:
-            trace_print(bpf)
+        trace_print(bpf)
         bpf.perf_buffer_poll()
         time.sleep(1)
