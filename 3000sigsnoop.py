@@ -45,8 +45,11 @@ def print_formatted_items(*args, header=0):
     """
     Print items according to the specified row format.
     """
-    row_format = "{:>16} {:>8} {:>10} {:>5} {:>5} {:>16}"
-    print(row_format.format(*args))
+    row_format = "{:<16}  {:>10}  {:>10}  {:>5}  {:>5}  {:>16}"
+    s = row_format.format(*args)
+    print(s)
+    if header:
+        print('-' * len(s))
 
 def on_exit(bpf):
     """
@@ -123,7 +126,7 @@ if __name__ == '__main__':
     atexit.register(on_exit, bpf)
 
     print("Tracing signals, ctrl-c to quit...", file=sys.stderr)
-    print_formatted_items("COMM", "PID", "SIGNAL", "CODE", "ERRNO", "OVERHEAD (S)", header=1)
+    print_formatted_items("COMM (RECV)", "PID (RECV)", "SIGNAL", "CODE", "ERRNO", "OVERHEAD (S)", header=1)
     while True:
         trace_print(bpf)
         bpf.perf_buffer_poll()
