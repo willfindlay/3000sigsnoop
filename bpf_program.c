@@ -19,8 +19,16 @@
 
 #include "bpf_program.h"
 
-BPF_PERCPU_ARRAY(intermediate, struct sigsnoopinfo, 1);
+/* Helper to initialize sigsnoopstack structs */
+BPF_ARRAY(__sigsnoopstack_init, struct sigsnoopstack, 1);
+
+/* An LRU hash of SIGSNOOP_MAX_PROCESSES signal stacks */
+BPF_F_TABLE("lru_hash", u32, struct sigsnoopstack, signal_stacks, SIGSNOOP_MAX_PROCESSES, 0);
+
+/* Intermediate helper array, stores memory address of ksignal pointer */
 BPF_PERCPU_ARRAY(addrs, struct addr_struct, 1);
+
+/* Perf buffers for returning information to userspace */
 BPF_PERF_OUTPUT(sig_enter_events);
 BPF_PERF_OUTPUT(sig_return_events);
 
@@ -62,6 +70,12 @@ static u32 bpf_get_pid()
     return (u32)(bpf_get_current_pid_tgid() >> 32);
 }
 
+/* Keep userland tid and ignore pid */
+static u32 bpf_get_tid()
+{
+    return (u32)(bpf_get_current_pid_tgid());
+}
+
 /* Return 0 if the filter is OK */
 static int filter()
 {
@@ -76,6 +90,53 @@ static int filter()
 #endif
 }
 
+static int push(struct sigsnoopstack *stack)
+{
+    if (stack->top < SIGSNOOP_STACK_SIZE - 1)
+        stack->top++;
+    else
+        return -1;
+
+    struct sigsnoopinfo *info = stacktop(stack);
+    if (!info)
+        return -2;
+
+    info->signal = 0;
+    info->code = 0;
+    info->errno = 0;
+    info->overhead = 0;
+
+    return 0;
+}
+
+static int pop(struct sigsnoopstack *stack)
+{
+    /* We allow -1 for an empty stack */
+    if (stack->top > -1)
+        stack->top--;
+    else
+        return -1;
+
+    return 0;
+}
+
+/* Get the top of a signal stack */
+static struct sigsnoopinfo *stacktop(struct sigsnoopstack *stack)
+{
+    if (!stack)
+        return NULL;
+
+    /* Soothe the verifier */
+#pragma unroll
+    for (int i = 0; i < SIGSNOOP_STACK_SIZE; i++)
+    {
+        if (stack->top == i)
+            return &stack->info[i];
+    }
+
+    return NULL;
+}
+
 /* BPF programs below this line ------------------------------ */
 
 /* Signal handler setup and entry */
@@ -85,14 +146,27 @@ int kprobe__do_signal(struct pt_regs *ctx)
         return 0;
 
     int zero = 0;
+    u32 tid = bpf_get_tid();
 
-    struct sigsnoopinfo data = {};
+    /* Try to initialize an entry in signal_stacks */
+    struct sigsnoopstack *stack = __sigsnoopstack_init.lookup(&zero);
+    if (!stack)
+        return -1;
+    /* Set top to -1 to indicate empty stack */
+    stack->top = -1;
+    stack = signal_stacks.lookup_or_init(&tid, stack);
+    if (!stack)
+        return -2;
 
-    bpf_get_current_comm(data.comm, sizeof(data.comm));
-    data.pid = bpf_get_pid();
-    data.overhead = bpf_ktime_get_ns();
+    /* Set comm and pid */
+    bpf_get_current_comm(stack->comm, sizeof(stack->comm));
+    stack->pid = bpf_get_pid();
 
-    intermediate.update(&zero, &data);
+    push(stack);
+    struct sigsnoopinfo *info = stacktop(stack);
+    if (!info)
+        return -3;
+    info->overhead = bpf_ktime_get_ns();
 
     return 0;
 }
@@ -119,6 +193,7 @@ int kretprobe__get_signal(struct pt_regs *ctx)
         return 0;
 
     int zero = 0;
+    u32 tid = bpf_get_tid();
 
     struct addr_struct *addr = addrs.lookup(&zero);
     if (!addr)
@@ -128,39 +203,65 @@ int kretprobe__get_signal(struct pt_regs *ctx)
     if (!ksig)
         return -2;
 
-    struct sigsnoopinfo *data = intermediate.lookup(&zero);
-    if (!data)
+    struct sigsnoopstack *stack = signal_stacks.lookup(&tid);
+    if (!stack)
         return -3;
 
-    /* Populate signal information */
-    data->signal = ksig->info.si_signo;
-    data->code   = ksig->info.si_code;
-    data->errno  = ksig->info.si_errno;
+    struct sigsnoopinfo *info = stacktop(stack);
+    if (!info)
+        return -4;
 
-    /* Cleanup */
+    /* Populate signal information */
+    info->signal = ksig->info.si_signo;
+    info->code   = ksig->info.si_code;
+    info->errno  = ksig->info.si_errno;
+
+    /* Cleanup addr struct */
     addrs.delete(&zero);
 
     return 0;
 }
 
+/* Pop sigsnoopinfo struct from the stack and return data to userspace */
 TRACEPOINT_PROBE(syscalls, sys_enter_rt_sigreturn)
 {
     if (filter())
         return 0;
 
     int zero = 0;
+    u32 tid = bpf_get_tid();
 
-    struct sigsnoopinfo *data = intermediate.lookup(&zero);
-    if (!data)
+    struct sigsnoopstack *stack = signal_stacks.lookup(&tid);
+    if (!stack)
         return -3;
 
+    struct sigsnoopinfo *info = stacktop(stack);
+    if (!info)
+        return -4;
+
     /* Calculate overhead */
-    data->overhead = bpf_ktime_get_ns() - data->overhead;
+    info->overhead = bpf_ktime_get_ns() - info->overhead;
 
-    sig_return_events.perf_submit((struct pt_regs *)args, data, sizeof(*data));
+    struct __event event = {};
+    event.signal = info->signal;
+    event.code = info->code;
+    event.errno = info->errno;
+    event.overhead = info->overhead;
+    event.pid = stack->pid;
+    bpf_probe_read_str(event.comm, sizeof(stack->comm), stack->comm);
 
-    intermediate.delete(&zero);
+    sig_return_events.perf_submit((struct pt_regs *)args, &event, sizeof(event));
+
+    pop(stack);
 
     return 0;
 }
 
+/* Reap signal stack when a process or thread exits */
+TRACEPOINT_PROBE(sched, sched_process_exit)
+{
+    u32 tid = bpf_get_tid();
+    signal_stacks.delete(&tid);
+
+    return 0;
+}

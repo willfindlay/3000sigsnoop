@@ -24,21 +24,32 @@
 #include <linux/signal.h>
 
 #define SIGSNOOP_STACK_SIZE 5
+#define SIGSNOOP_MAX_PROCESSES 1000
 
 struct sigsnoopinfo
 {
     int signal;
     int code;
     int errno;
-    u32 pid;
     u64 overhead;
-    char comm[TASK_COMM_LEN];
 };
 
 struct sigsnoopstack
 {
     int top;
-    struct sigsnoopinfo items[SIGSNOOP_STACK_SIZE];
+    struct sigsnoopinfo info[SIGSNOOP_STACK_SIZE];
+    u32 pid;
+    char comm[TASK_COMM_LEN];
+};
+
+struct __event
+{
+    int signal;
+    int code;
+    int errno;
+    u64 overhead;
+    u32 pid;
+    char comm[TASK_COMM_LEN];
 };
 
 struct addr_struct
@@ -46,10 +57,15 @@ struct addr_struct
     void *addr;
 };
 
+static struct sigsnoopinfo *stacktop(struct sigsnoopstack *stack);
+static int push(struct sigsnoopstack *stack);
+static int pop(struct sigsnoopstack *stack);
+
 static inline u32 bpf_strlen(char *s);
 static inline int bpf_strncmp(char *s1, char *s2, u32 n);
 static inline int bpf_strcmp(char *s1, char *s2);
 static u32 bpf_get_pid();
+static u32 bpf_get_tid();
 static int filter();
 
 #endif /* BPF_PROGRAM_H */
