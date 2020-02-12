@@ -132,12 +132,10 @@ int kretprobe__get_signal(struct pt_regs *ctx)
     if (!data)
         return -3;
 
+    /* Populate signal information */
     data->signal = ksig->info.si_signo;
     data->code   = ksig->info.si_code;
     data->errno  = ksig->info.si_errno;
-
-    /* Send signal receive event */
-    //sig_enter_events.perf_submit(ctx, data, sizeof(*data));
 
     /* Cleanup */
     addrs.delete(&zero);
@@ -145,8 +143,7 @@ int kretprobe__get_signal(struct pt_regs *ctx)
     return 0;
 }
 
-/* Signal handler exit and cleanup */
-int kretprobe__do_signal(struct pt_regs *ctx)
+TRACEPOINT_PROBE(syscalls, sys_enter_rt_sigreturn)
 {
     if (filter())
         return 0;
@@ -157,11 +154,13 @@ int kretprobe__do_signal(struct pt_regs *ctx)
     if (!data)
         return -3;
 
+    /* Calculate overhead */
     data->overhead = bpf_ktime_get_ns() - data->overhead;
 
-    sig_return_events.perf_submit(ctx, data, sizeof(*data));
+    sig_return_events.perf_submit((struct pt_regs *)args, data, sizeof(*data));
 
     intermediate.delete(&zero);
 
     return 0;
 }
+

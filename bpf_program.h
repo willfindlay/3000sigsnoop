@@ -23,6 +23,8 @@
 #include <linux/sched.h>
 #include <linux/signal.h>
 
+#define SIGSNOOP_STACK_SIZE 5
+
 struct sigsnoopinfo
 {
     int signal;
@@ -31,6 +33,12 @@ struct sigsnoopinfo
     u32 pid;
     u64 overhead;
     char comm[TASK_COMM_LEN];
+};
+
+struct sigsnoopstack
+{
+    int top;
+    struct sigsnoopinfo items[SIGSNOOP_STACK_SIZE];
 };
 
 struct addr_struct
